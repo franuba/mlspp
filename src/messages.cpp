@@ -398,6 +398,7 @@ operator<<(tls::ostream& str, const GroupContentAuthData& obj)
   switch (obj.content_type) {
     case ContentType::proposal:
     case ContentType::application:
+    case ContentType::sheader:
       return str << obj.signature;
 
     case ContentType::commit:
@@ -414,6 +415,7 @@ operator>>(tls::istream& str, GroupContentAuthData& obj)
   switch (obj.content_type) {
     case ContentType::proposal:
     case ContentType::application:
+    case ContentType::sheader:
       return str >> obj.signature;
 
     case ContentType::commit:
@@ -467,6 +469,10 @@ GroupContent::GroupContent(bytes group_id_in,
 
     case ContentType::application:
       content.emplace<ApplicationData>();
+      break;
+
+    case ContentType::sheader:
+      content.emplace<SHeader>();
       break;
 
     default:
@@ -985,6 +991,22 @@ PrivateMessage::PrivateMessage(GroupContent content,
 }
 
 bytes
+FramedSHeader::get_group_id() const
+{
+  return var::visit(
+    [](const auto& msg) -> bytes { return msg.get_group_id(); },
+    message);
+}
+
+epoch_t
+FramedSHeader::get_epoch() const
+{
+  return var::visit(
+    [](const auto& msg) -> epoch_t { return msg.get_epoch(); },
+    message);
+}
+
+bytes
 MLSMessage::group_id() const
 {
   return var::visit(
@@ -992,6 +1014,8 @@ MLSMessage::group_id() const
       [](const PublicMessage& pt) -> bytes { return pt.get_group_id(); },
       [](const PrivateMessage& ct) -> bytes { return ct.get_group_id(); },
       [](const GroupInfo& gi) -> bytes { return gi.group_context.group_id; },
+      [](const SCommit& sc) -> bytes { return sc.sheader.get_group_id(); },
+      [](const ICommit& ic) -> bytes { return ic.sheader.get_group_id(); },
       [](const auto& /* unused */) -> bytes {
         throw InvalidParameterError("MLSMessage has no group_id");
       },
@@ -1006,6 +1030,8 @@ MLSMessage::epoch() const
     overloaded{
       [](const PublicMessage& pt) -> epoch_t { return pt.get_epoch(); },
       [](const PrivateMessage& pt) -> epoch_t { return pt.get_epoch(); },
+      [](const SCommit& sc) -> epoch_t { return sc.sheader.get_epoch(); },
+      [](const ICommit& ic) -> epoch_t { return ic.sheader.get_epoch(); },
       [](const auto& /* unused */) -> epoch_t {
         throw InvalidParameterError("MLSMessage has no epoch");
       },
@@ -1041,6 +1067,16 @@ MLSMessage::MLSMessage(GroupInfo group_info)
 
 MLSMessage::MLSMessage(KeyPackage key_package)
   : message(std::move(key_package))
+{
+}
+
+MLSMessage::MLSMessage(SCommit scommit)
+  : message(std::move(scommit))
+{
+}
+
+MLSMessage::MLSMessage(ICommit icommit)
+  : message(std::move(icommit))
 {
 }
 

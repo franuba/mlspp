@@ -391,6 +391,51 @@ struct Commit
   TLS_SERIALIZABLE(proposals, path)
 };
 
+// SplitCommit (draft-mularczyk-mls-splitcommit §3)
+//
+// struct {
+//     ProposalOrRef proposals<V>;
+//     optional<LeafNode> leaf_node;
+//     opaque epoch_identifier<V>;
+// } SHeader;
+//
+// The epoch_identifier is empty when the SHeader is used as input to the
+// confirmed transcript hash (draft §5) and populated with the value exported
+// from the new epoch's key schedule when the SHeader is signed and sent.
+struct SHeader
+{
+  std::vector<ProposalOrRef> proposals;
+  std::optional<LeafNode> leaf_node;
+  bytes epoch_identifier;
+
+  TLS_SERIALIZABLE(proposals, leaf_node, epoch_identifier)
+};
+
+// struct {
+//     UpdatePathNode nodes<V>;
+// } SUpdatePath;
+//
+// The SUpdatePath is an UpdatePath without the committer's LeafNode; it is
+// not encrypted, allowing a DS to split the HPKE public keys and ciphertexts.
+struct SUpdatePath
+{
+  std::vector<UpdatePathNode> nodes;
+
+  TLS_SERIALIZABLE(nodes)
+};
+
+// struct {
+//     HPKECiphertext encrypted_path_secret;
+//     HPKEPublicKey new_pks<V>;
+// } IUpdatePath;
+struct IUpdatePath
+{
+  HPKECiphertext encrypted_path_secret;
+  std::vector<HPKEPublicKey> new_pks;
+
+  TLS_SERIALIZABLE(encrypted_path_secret, new_pks)
+};
+
 // struct {
 //     opaque group_id<0..255>;
 //     uint32 epoch;
@@ -424,6 +469,11 @@ enum struct WireFormat : uint16_t
   mls_welcome = 3,
   mls_group_info = 4,
   mls_key_package = 5,
+
+  // SplitCommit (draft-mularczyk-mls-splitcommit); the draft does not assign
+  // code points, these are prototype values and must not be assumed to interop
+  mls_scommit = 6,
+  mls_individual_commit = 7,
 };
 
 enum struct ContentType : uint8_t
@@ -432,6 +482,7 @@ enum struct ContentType : uint8_t
   application = 1,
   proposal = 2,
   commit = 3,
+  sheader = 4,
 };
 
 enum struct SenderType : uint8_t
@@ -486,7 +537,8 @@ struct GroupKeySource;
 
 struct GroupContent
 {
-  using RawContent = var::variant<ApplicationData, Proposal, Commit>;
+  using RawContent =
+    var::variant<ApplicationData, Proposal, Commit, SHeader>;
 
   bytes group_id;
   epoch_t epoch;
@@ -662,10 +714,56 @@ private:
                  bytes ciphertext_in);
 };
 
+// SplitCommit (draft-mularczyk-mls-splitcommit §3)
+//
+// struct {
+//     MLSMessage sheader; /* PrivateMessage or PublicMessage containing SHeader */
+//     ...
+// } SCommit;
+//
+// The draft types the `sheader` field as an MLSMessage restricted to the two
+// framing variants.  Storing MLSMessage itself would make the C++ type
+// recursive (MLSMessage -> SCommit -> MLSMessage), so we use the restricted
+// variant directly; it has the same wire encoding (version + wire format +
+// framed content) via the same TLS traits.
+struct FramedSHeader
+{
+  ProtocolVersion version = ProtocolVersion::mls10;
+  var::variant<PublicMessage, PrivateMessage> message;
+
+  bytes get_group_id() const;
+  epoch_t get_epoch() const;
+
+  TLS_SERIALIZABLE(version, message)
+  TLS_TRAITS(tls::pass, tls::variant<WireFormat>)
+};
+
+struct SCommit
+{
+  FramedSHeader sheader;
+  std::optional<SUpdatePath> path;
+
+  TLS_SERIALIZABLE(sheader, path)
+};
+
+struct ICommit
+{
+  FramedSHeader sheader;
+  std::optional<IUpdatePath> path;
+
+  TLS_SERIALIZABLE(sheader, path)
+};
+
 struct MLSMessage
 {
   ProtocolVersion version = ProtocolVersion::mls10;
-  var::variant<PublicMessage, PrivateMessage, Welcome, GroupInfo, KeyPackage>
+  var::variant<PublicMessage,
+               PrivateMessage,
+               Welcome,
+               GroupInfo,
+               KeyPackage,
+               SCommit,
+               ICommit>
     message;
 
   bytes group_id() const;
@@ -678,6 +776,8 @@ struct MLSMessage
   MLSMessage(Welcome welcome);
   MLSMessage(GroupInfo group_info);
   MLSMessage(KeyPackage key_package);
+  MLSMessage(SCommit scommit);
+  MLSMessage(ICommit icommit);
 
   TLS_SERIALIZABLE(version, message)
   TLS_TRAITS(tls::pass, tls::variant<WireFormat>)
@@ -765,6 +865,12 @@ TLS_VARIANT_MAP(MLS_NAMESPACE::ContentType,
                 application)
 TLS_VARIANT_MAP(MLS_NAMESPACE::ContentType, MLS_NAMESPACE::Proposal, proposal)
 TLS_VARIANT_MAP(MLS_NAMESPACE::ContentType, MLS_NAMESPACE::Commit, commit)
+TLS_VARIANT_MAP(MLS_NAMESPACE::ContentType, MLS_NAMESPACE::SHeader, sheader)
+
+TLS_VARIANT_MAP(MLS_NAMESPACE::WireFormat, MLS_NAMESPACE::SCommit, mls_scommit)
+TLS_VARIANT_MAP(MLS_NAMESPACE::WireFormat,
+                MLS_NAMESPACE::ICommit,
+                mls_individual_commit)
 
 TLS_VARIANT_MAP(MLS_NAMESPACE::SenderType, MLS_NAMESPACE::MemberSender, member)
 TLS_VARIANT_MAP(MLS_NAMESPACE::SenderType,

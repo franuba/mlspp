@@ -184,6 +184,7 @@ GroupKeySource::chain(ContentType type, LeafIndex sender)
   switch (type) {
     case ContentType::proposal:
     case ContentType::commit:
+    case ContentType::sheader:
       return chain(RatchetType::handshake, sender);
 
     case ContentType::application:

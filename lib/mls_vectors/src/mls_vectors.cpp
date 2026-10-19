@@ -72,6 +72,7 @@ operator<<(std::ostream& str, const GroupContent::RawContent& obj)
       [&](const ApplicationData&) -> std::ostream& {
         return str << "[ApplicationData]";
       },
+      [&](const SHeader&) -> std::ostream& { return str << "[SHeader]"; },
     },
     obj);
 }

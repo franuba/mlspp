@@ -819,6 +819,102 @@ State::commit(const bytes& leaf_secret,
   return std::make_tuple(commit_message, welcome, next);
 }
 
+std::tuple<MLSMessage, Welcome, State>
+State::commit_split(const bytes& leaf_secret,
+                    const std::optional<CommitOpts>& opts,
+                    const MessageOpts& msg_opts)
+{
+  return commit_split(leaf_secret, opts, msg_opts, NormalCommitParams{});
+}
+
+std::tuple<MLSMessage, Welcome, State>
+State::commit_split(const bytes& leaf_secret,
+                    const std::optional<CommitOpts>& opts,
+                    const MessageOpts& msg_opts,
+                    const CommitParams& params)
+{
+  // Compute the new group state (identical to a normal commit)
+  auto commit_materials = prepare_commit(leaf_secret, opts, params);
+
+  // Split the update path into its header part (the committer's LeafNode) and
+  // the splittable path (the per-node HPKE material, without the LeafNode)
+  auto s_path = std::optional<SUpdatePath>{};
+  auto leaf_node = std::optional<LeafNode>{};
+  if (commit_materials.path.has_value()) {
+    leaf_node = commit_materials.path->leaf_node;
+    s_path = SUpdatePath{ commit_materials.path->nodes };
+  }
+
+  auto sender = Sender{ MemberSender{ _index } };
+  if (commit_materials.force_init_secret) {
+    sender = Sender{ NewMemberCommitSender{} };
+  }
+
+  // Preliminary SHeader with an empty epoch_identifier.  Only its serialization
+  // (with an empty signature) feeds the confirmed transcript hash, per draft
+  // §5; the value does not depend on the epoch_identifier or the signature.
+  const auto prelim_header =
+    SHeader{ commit_materials.proposals, leaf_node, {} };
+  const auto prelim = sign(sender,
+                           prelim_header,
+                           msg_opts.authenticated_data,
+                           msg_opts.encrypt);
+
+  // Update confirmed transcript hash and ratchet the key schedule forward.  The
+  // interim transcript hash is updated with the locally computed confirmation
+  // tag, which is never transmitted for SplitCommit (draft §7.3 TODO).
+  const auto confirmed_transcript_hash = _transcript_hash.new_confirmed(
+    prelim.split_confirmed_transcript_hash_input());
+
+  auto next = successor(commit_materials.index,
+                        std::move(commit_materials.new_tree),
+                        std::move(commit_materials.new_tree_priv),
+                        std::move(commit_materials.extensions),
+                        confirmed_transcript_hash,
+                        commit_materials.path.has_value(),
+                        commit_materials.psks,
+                        commit_materials.force_init_secret);
+
+  // Export the epoch identifier from the new epoch and complete the SHeader
+  const auto epoch_identifier = next._key_schedule.do_export(
+    "SplittableCommit", {}, _suite.secret_size());
+
+  const auto final_header =
+    SHeader{ commit_materials.proposals, leaf_node, epoch_identifier };
+  auto content_auth = sign(sender,
+                           final_header,
+                           msg_opts.authenticated_data,
+                           msg_opts.encrypt);
+
+  auto sheader_message =
+    protect(std::move(content_auth), msg_opts.padding_size);
+
+  const auto framed = var::visit(
+    overloaded{
+      [](PublicMessage&& message) -> FramedSHeader {
+        return FramedSHeader{ ProtocolVersion::mls10, std::move(message) };
+      },
+      [](PrivateMessage&& message) -> FramedSHeader {
+        return FramedSHeader{ ProtocolVersion::mls10, std::move(message) };
+      },
+      [](auto&& /* unused */) -> FramedSHeader {
+        throw InvalidParameterError("Unexpected framing for SHeader");
+      },
+    },
+    std::move(sheader_message.message));
+
+  // Create the welcome message
+  const auto inline_tree = opts && opt::get(opts).inline_tree;
+  const auto welcome = next.welcome(inline_tree,
+                                    commit_materials.psks,
+                                    commit_materials.joiners,
+                                    commit_materials.path_secrets);
+
+  auto scommit = SCommit{ std::move(framed), std::move(s_path) };
+  return std::make_tuple(
+    MLSMessage{ std::move(scommit) }, welcome, std::move(next));
+}
+
 ///
 /// Message handlers
 ///

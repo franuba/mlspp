@@ -601,6 +601,11 @@ struct AuthenticatedContent
   bytes confirmed_transcript_hash_input() const;
   bytes interim_transcript_hash_input() const;
 
+  // SplitCommit (draft-mularczyk-mls-splitcommit §5): input to the confirmed
+  // transcript hash for an SHeader content -- the FramedContent with an empty
+  // epoch_identifier and no signature.
+  bytes split_confirmed_transcript_hash_input() const;
+
   void set_confirmation_tag(const bytes& confirmation_tag);
   bool check_confirmation_tag(const bytes& confirmation_tag) const;
 

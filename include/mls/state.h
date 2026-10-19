@@ -124,6 +124,17 @@ public:
     const MessageOpts& msg_opts);
 
   ///
+  /// SplitCommit (draft-mularczyk-mls-splitcommit)
+  ///
+  /// Produce a splittable commit (SCommit) instead of a normal Commit.  The
+  /// returned message is an MLSMessage carrying an SCommit; the new State is
+  /// the committer's next state, already ratcheted into the new epoch.
+  std::tuple<MLSMessage, Welcome, State> commit_split(
+    const bytes& leaf_secret,
+    const std::optional<CommitOpts>& opts,
+    const MessageOpts& msg_opts);
+
+  ///
   /// Generic handshake message handlers
   ///
   std::optional<State> handle(const MLSMessage& msg);
@@ -333,6 +344,12 @@ protected:
                                     ReInitCommitParams>;
 
   std::tuple<MLSMessage, Welcome, State> commit(
+    const bytes& leaf_secret,
+    const std::optional<CommitOpts>& opts,
+    const MessageOpts& msg_opts,
+    const CommitParams& params);
+
+  std::tuple<MLSMessage, Welcome, State> commit_split(
     const bytes& leaf_secret,
     const std::optional<CommitOpts>& opts,
     const MessageOpts& msg_opts,

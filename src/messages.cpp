@@ -553,6 +553,21 @@ AuthenticatedContent::interim_transcript_hash_input() const
     InterimTranscriptHashInput{ opt::get(auth.confirmation_tag) });
 }
 
+bytes
+AuthenticatedContent::split_confirmed_transcript_hash_input() const
+{
+  if (content.content_type() != ContentType::sheader) {
+    throw InvalidParameterError("Not an SHeader content");
+  }
+
+  // The transcript input is the SHeader with an empty epoch_identifier, and the
+  // signature field is empty (draft-mularczyk-mls-splitcommit §5).
+  auto cleared = content;
+  var::get<SHeader>(cleared.content).epoch_identifier = {};
+  return tls::marshal(
+    ConfirmedTranscriptHashInput{ wire_format, cleared, bytes{} });
+}
+
 void
 AuthenticatedContent::set_confirmation_tag(const bytes& confirmation_tag)
 {

@@ -347,6 +347,67 @@ AnnotatedCommit::from(LeafIndex receiver,
 }
 
 ///
+/// AnnotatedICommit
+///
+
+AnnotatedICommit
+AnnotatedICommit::from(LeafIndex receiver,
+                       const std::vector<MLSMessage>& proposals,
+                       const ICommit& icommit,
+                       const TreeKEMPublicKey& tree_before,
+                       const TreeKEMPublicKey& tree_after)
+{
+  // The DS has already selected the single ciphertext this receiver decrypts,
+  // so unlike AnnotatedCommit::from we do not need the committed proposals to
+  // locate a resolution entry.  The parameter is kept for symmetry with
+  // AnnotatedCommit::from (and for future proposal verification).
+  (void)proposals;
+
+  // Unpack the public SHeader (draft: the DS can only split public headers)
+  if (!var::holds_alternative<PublicMessage>(icommit.sheader.message)) {
+    throw InvalidParameterError(
+      "SplitCommit: only public SHeader framing is supported");
+  }
+
+  const auto& content_auth =
+    var::get<PublicMessage>(icommit.sheader.message).authenticated_content();
+  const auto& sender = content_auth.content.sender;
+
+  switch (sender.sender_type()) {
+    case SenderType::member:
+      break;
+
+    default:
+      // External commits have no MemberSender and are out of scope for the
+      // prototype (see splitcommit_delta.md).
+      throw ProtocolError("Invalid commit sender type");
+  }
+
+  const auto sender_location = var::get<MemberSender>(sender.sender).sender;
+
+  // Extract the membership proofs and the post-commit tree hash, exactly as
+  // AnnotatedCommit::from does; a partial client rebuilds the tree from the
+  // sender and receiver proofs.
+  const auto tree_hash_after = tree_after.root_hash();
+
+  auto sender_membership_proof_before = std::optional<TreeSlice>{};
+  sender_membership_proof_before = tree_before.extract_slice(sender_location);
+
+  const auto sender_membership_proof_after = tree_after.extract_slice(
+    sender_location);
+  const auto receiver_membership_proof_after = tree_after.extract_slice(
+    receiver);
+
+  return {
+    icommit,
+    tree_hash_after,
+    sender_membership_proof_before,
+    sender_membership_proof_after,
+    receiver_membership_proof_after,
+  };
+}
+
+///
 /// Commit
 ///
 std::optional<bytes>

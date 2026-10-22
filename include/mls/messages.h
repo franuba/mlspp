@@ -813,6 +813,36 @@ struct AnnotatedWelcome
   TLS_SERIALIZABLE(welcome, sender_membership_proof, receiver_membership_proof);
 };
 
+// SplitCommit (draft-mularczyk-mls-splitcommit §4): the individual commit a DS
+// hands to one receiver.  It carries the framed SHeader plus the single HPKE
+// ciphertext (and path keys below the common ancestor) for this receiver.
+//
+// The annotation mirrors AnnotatedCommit: a partial client rebuilds the
+// post-commit tree from the sender/receiver membership proofs, and a full
+// client (one that holds the whole tree) can do the same or reconstruct the
+// sender path itself.  `sender_membership_proof_before` is absent for external
+// commits, exactly as in AnnotatedCommit.
+struct AnnotatedICommit
+{
+  ICommit icommit;
+  bytes tree_hash_after;
+  std::optional<TreeSlice> sender_membership_proof_before;
+  TreeSlice sender_membership_proof_after;
+  TreeSlice receiver_membership_proof_after;
+
+  static AnnotatedICommit from(LeafIndex receiver,
+                               const std::vector<MLSMessage>& proposals,
+                               const ICommit& icommit,
+                               const TreeKEMPublicKey& tree_before,
+                               const TreeKEMPublicKey& tree_after);
+
+  TLS_SERIALIZABLE(icommit,
+                   tree_hash_after,
+                   sender_membership_proof_before,
+                   sender_membership_proof_after,
+                   receiver_membership_proof_after);
+};
+
 struct AnnotatedCommit
 {
   MLSMessage commit_message;

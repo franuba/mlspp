@@ -150,6 +150,12 @@ public:
   ///
   void implant_tree_slice(const TreeSlice& slice);
   State handle(const AnnotatedCommit& annotated_commit);
+
+  // SplitCommit (draft-mularczyk-mls-splitcommit): process an individual commit
+  // (ICommit) as produced by the DS splitting an SCommit.  A full client also
+  // consumes the sender membership proofs to reconstruct the new tree; a
+  // partial client uses only the state it already has.
+  State handle(const AnnotatedICommit& annotated_icommit);
   bool is_full_client() const { return _tree.is_complete(); }
   void upgrade_to_full_client(TreeKEMPublicKey tree);
 
@@ -383,7 +389,7 @@ protected:
                 const std::vector<PSKWithSecret>& psks,
                 const std::optional<bytes>& force_init_secret,
                 const bytes& confirmed_transcript_hash,
-                const bytes& confirmation_tag) const;
+                const std::optional<bytes>& confirmation_tag) const;
 
   // Create an MLSMessage encapsulating some content
   template<typename Inner>

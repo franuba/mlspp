@@ -1137,7 +1137,7 @@ State::ratchet(TreeKEMPublicKey new_tree,
                const std::vector<PSKWithSecret>& psks,
                const std::optional<bytes>& force_init_secret,
                const bytes& confirmed_transcript_hash,
-               const bytes& confirmation_tag) const
+               const std::optional<bytes>& confirmation_tag) const
 {
   // Update the TreeKEM private key to match the public key
   auto new_tree_priv = _tree_priv;
@@ -1187,8 +1187,12 @@ State::ratchet(TreeKEMPublicKey new_tree,
                         psks,
                         force_init_secret);
 
-  // Verify the confirmation MAC
-  if (next._key_schedule.confirmation_tag != confirmation_tag) {
+  // Verify the confirmation MAC.  SplitCommit does not transmit the tag
+  // (draft-mularczyk-mls-splitcommit §5); the caller verifies the epoch
+  // identifier instead.  The locally computed tag still updates the interim
+  // transcript hash inside successor().
+  if (confirmation_tag &&
+      next._key_schedule.confirmation_tag != opt::get(confirmation_tag)) {
     throw ProtocolError("Confirmation failed to verify");
   }
 
@@ -1341,6 +1345,201 @@ State::handle(const AnnotatedCommit& annotated_commit)
                  force_init_secret,
                  new_confirmed_transcript_hash,
                  new_confirmation_tag);
+}
+
+State
+State::handle(const AnnotatedICommit& annotated_icommit)
+{
+  // SplitCommit (draft-mularczyk-mls-splitcommit §4/§5).  The ICommit carries
+  // the framed SHeader plus, for this receiver, a single HPKE ciphertext and
+  // the path public keys below the common ancestor.  The annotation adds the
+  // committer's and this receiver's membership proofs so that a partial client
+  // can rebuild the post-commit tree.
+  const auto& icommit = annotated_icommit.icommit;
+
+  // The DS only splits public SHeaders (a private SHeader hides the sender).
+  if (!var::holds_alternative<PublicMessage>(icommit.sheader.message)) {
+    throw InvalidParameterError(
+      "SplitCommit: only public SHeader framing is supported");
+  }
+
+  // Verify the sender's membership proof before the commit against the current
+  // tree hash.  (Unlike an external Commit, SplitCommit requires a member
+  // sender, so this proof is always present.)
+  const auto& sender_proof_before =
+    opt::get(annotated_icommit.sender_membership_proof_before);
+  if (sender_proof_before.tree_hash(_suite) != _tree.root_hash()) {
+    throw ProtocolError("Invalid sender membership proof");
+  }
+
+  // ... and verify that the same leaf is proved before and after
+  if (sender_proof_before.leaf_index !=
+      annotated_icommit.sender_membership_proof_after.leaf_index) {
+    throw ProtocolError("Inconsistent sender membership proofs before/after");
+  }
+
+  const auto sender_location =
+    annotated_icommit.sender_membership_proof_after.leaf_index;
+
+  // Verify the membership proofs are consistent with the claimed tree hash
+  const auto tree_hash_after =
+    annotated_icommit.sender_membership_proof_after.tree_hash(_suite);
+  if (tree_hash_after !=
+      annotated_icommit.receiver_membership_proof_after.tree_hash(_suite)) {
+    throw ProtocolError("Inconsistent sender and receiver membership proofs");
+  }
+
+  if (tree_hash_after != annotated_icommit.tree_hash_after) {
+    throw ProtocolError("Incorrect tree hash after split commit");
+  }
+
+  if (_index != annotated_icommit.receiver_membership_proof_after.leaf_index) {
+    throw ProtocolError("Receiver membership proof is not for this node");
+  }
+
+  // Verify that the receiver's leaf node in the post-commit proof matches our
+  // current leaf node (we may have issued a self-update in a cached state).
+  const auto my_leaf = opt::get(_tree.leaf_node(_index));
+  const auto& proof_node =
+    opt::get(annotated_icommit.receiver_membership_proof_after.direct_path_nodes[0].node);
+  const auto& proof_leaf = var::get<LeafNode>(proof_node.node);
+  if (my_leaf != proof_leaf) {
+    throw ProtocolError("Incorrect leaf node in receiver membership proof");
+  }
+
+  // Unframe the SHeader and verify its signature against the sender's leaf in
+  // the old tree (the SHeader is signed over the old epoch's GroupContext).
+  auto validated =
+    var::get<PublicMessage>(icommit.sheader.message).unprotect(
+      _suite, _key_schedule.membership_key, group_context());
+  if (!validated) {
+    throw ProtocolError("Membership tag failed to verify");
+  }
+
+  const auto& content_auth = validated->authenticated_content();
+  const auto& sheader = var::get<SHeader>(content_auth.content.content);
+  const auto& content = content_auth.content;
+  if (content.sender.sender_type() != SenderType::member ||
+      var::get<MemberSender>(content.sender.sender).sender != sender_location) {
+    throw ProtocolError("Incorrect commit sender");
+  }
+
+  if (!content_auth.verify(_suite,
+                           opt::get(_tree.leaf_node(sender_location))
+                             .signature_key,
+                           group_context())) {
+    throw ProtocolError("SHeader signature failed to verify");
+  }
+
+  // Rebuild the post-commit tree from the sender and receiver proofs.  A full
+  // client could instead apply the proposals to its local tree and merge the
+  // reconstructed path; both arrive at the same tree, so the prototype uses the
+  // proof-based construction for both (see "Full-client O(N) hazards" in
+  // splitcommit_delta.md).
+  auto new_tree =
+    TreeKEMPublicKey(_suite, annotated_icommit.sender_membership_proof_after);
+  new_tree.implant_slice(annotated_icommit.receiver_membership_proof_after);
+
+  // Identify the encrypted path secret and how to decrypt it.  The ICommit
+  // carries exactly one ciphertext: the resolution entry the receiver uses at
+  // its common ancestor with the committer.
+  auto path_secret_decrypt_node = std::optional<NodeIndex>{};
+  auto encrypted_path_secret = std::optional<HPKECiphertext>{};
+  if (icommit.path) {
+    const auto& path = opt::get(icommit.path);
+
+    if (!sheader.leaf_node) {
+      throw ProtocolError("SplitCommit path present without SHeader leaf_node");
+    }
+
+    if (!valid(opt::get(sheader.leaf_node),
+               LeafNodeSource::commit,
+               sender_location)) {
+      throw ProtocolError("Commit path has invalid leaf node");
+    }
+
+    // The new keys below the common ancestor are given directly; the keys above
+    // are derived from the decrypted path secret by the ratchet.  Verify the
+    // supplied keys positionally against the sender's post-commit direct path,
+    // which the sender membership proof already authenticates (draft: the
+    // receiver maps `new_pks[i]` to the i-th path node below the LCA).
+    const auto coords = new_tree.ancestor_index(_index, sender_location);
+    path_secret_decrypt_node = coords.resolution_node;
+    encrypted_path_secret = path.encrypted_path_secret;
+
+    if (path.new_pks.size() != coords.ancestor_node_index) {
+      throw ProtocolError("Incorrect number of new path keys");
+    }
+
+    // Walk the sender's direct path from the leaf upward, skipping blank nodes,
+    // and match the first `ancestor_node_index` keys.  (The direct path is
+    // ordered leaf-first, as is `new_pks`.)
+    const auto& dp =
+      annotated_icommit.sender_membership_proof_after.direct_path_nodes;
+    auto path_index = size_t(0);
+    for (auto i = size_t(1);
+         i < dp.size() && path_index < coords.ancestor_node_index;
+         i++) {
+      if (dp.at(i).blank()) {
+        continue;
+      }
+
+      if (opt::get(dp.at(i).node).public_key() != path.new_pks.at(path_index)) {
+        throw ProtocolError("Incorrect new path key");
+      }
+      path_index += 1;
+    }
+
+    if (path_index != coords.ancestor_node_index) {
+      throw ProtocolError("Incorrect number of new path keys");
+    }
+  }
+
+  // Update the transcript hash.  Draft §5: the confirmed transcript hash input
+  // is the SHeader with an empty epoch_identifier and no signature.
+  const auto new_confirmed_transcript_hash = _transcript_hash.new_confirmed(
+    content_auth.split_confirmed_transcript_hash_input());
+
+  // Identify GCE or PSK proposals, as in handle(AnnotatedCommit)
+  const auto proposals = must_resolve(sheader.proposals, sender_location);
+  auto extensions = _extensions;
+  auto psk_ids = std::vector<PreSharedKeyID>{};
+  for (const auto& p : proposals) {
+    if (p.proposal.proposal_type() == ProposalType::psk) {
+      const auto& psk_proposal = var::get<PreSharedKey>(p.proposal.content);
+      psk_ids.push_back(psk_proposal.psk);
+    }
+
+    if (p.proposal.proposal_type() == ProposalType::group_context_extensions) {
+      const auto& gce_proposal =
+        var::get<GroupContextExtensions>(p.proposal.content);
+      extensions = gce_proposal.group_context_extensions;
+    }
+  }
+
+  const auto psks = resolve(psk_ids);
+
+  // Ratchet without a transmitted confirmation tag (split mode): the locally
+  // computed tag feeds the interim transcript hash but is not verified.
+  auto next = ratchet(std::move(new_tree),
+                      sender_location,
+                      path_secret_decrypt_node,
+                      encrypted_path_secret,
+                      extensions,
+                      psks,
+                      std::nullopt,
+                      new_confirmed_transcript_hash,
+                      std::nullopt);
+
+  // Instead, verify the epoch identifier exported from the new epoch against
+  // the value carried in the SHeader (draft §5 / open issue 2).
+  const auto expected_epoch_identifier = next._key_schedule.do_export(
+    "SplittableCommit", {}, _suite.secret_size());
+  if (sheader.epoch_identifier != expected_epoch_identifier) {
+    throw ProtocolError("Split commit epoch identifier failed to verify");
+  }
+
+  return next;
 }
 
 void

@@ -2765,6 +2765,29 @@ State::leaf_for_roster_entry(RosterIndex index) const
   return opt::get(found);
 }
 
+State::State(const State& predecessor,
+             TreeKEMPublicKey tree,
+             TreeKEMPrivateKey tree_priv,
+             ExtensionList extensions,
+             LeafIndex index)
+  : _suite(predecessor._suite)
+  , _group_id(predecessor._group_id)
+  , _epoch(predecessor._epoch + 1)
+  , _tree(std::move(tree))
+  , _tree_priv(std::move(tree_priv))
+  , _transcript_hash(predecessor._transcript_hash)
+  , _extensions(std::move(extensions))
+  , _key_schedule(predecessor._key_schedule)
+  , _keys()
+  , _index(index)
+  , _identity_priv(predecessor._identity_priv)
+  , _external_psks(predecessor._external_psks)
+  , _resumption_psks(predecessor._resumption_psks)
+  , _pending_proposals()
+  , _cached_update(predecessor._cached_update)
+{
+}
+
 State
 State::successor(LeafIndex index,
                  TreeKEMPublicKey tree,
@@ -2775,14 +2798,14 @@ State::successor(LeafIndex index,
                  const std::vector<PSKWithSecret>& psks,
                  const std::optional<bytes>& force_init_secret) const
 {
-  // Initialize a clone with updates, clear things that shouldn't be copied
-  auto next = *this;
-  next._epoch += 1;
-  next._index = index;
-  next._tree = std::move(tree);
-  next._tree_priv = std::move(tree_priv);
-  next._extensions = std::move(extensions);
-  next._pending_proposals.clear();
+  // Initialize a successor state without copying the predecessor's ratchet
+  // tree: the new tree is supplied by the caller and always replaces the old
+  // one, so copying the (possibly dense) tree here would be O(N) wasted work.
+  auto next = State{ *this,
+                     std::move(tree),
+                     std::move(tree_priv),
+                     std::move(extensions),
+                     index };
 
   // Copy forward a resumption PSK
   next.add_resumption_psk(_group_id, _epoch, _key_schedule.resumption_psk);

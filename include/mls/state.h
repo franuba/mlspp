@@ -315,6 +315,18 @@ protected:
         std::map<bytes, bytes> external_psks,
         std::map<EpochRef, bytes> resumption_psks);
 
+  // Assemble a successor state without copying the predecessor's ratchet tree,
+  // which the successor always replaces.  For a full client that tree holds one
+  // node per leaf (plus cached hashes), so the copy is O(N) wasted work; it was
+  // measured at ~6% of SplitCommit handler instructions at N=256 and is not the
+  // source of the remaining full-client slope (see
+  // doc/mls/splitcommit_delta.md, "Full-client O(N) hazards").
+  State(const State& predecessor,
+        TreeKEMPublicKey tree,
+        TreeKEMPrivateKey tree_priv,
+        ExtensionList extensions,
+        LeafIndex index);
+
   // Import a tree from an externally-provided tree or an extension
   TreeKEMPublicKey import_tree(const bytes& tree_hash,
                                const std::optional<TreeKEMPublicKey>& external,

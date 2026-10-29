@@ -1,6 +1,7 @@
 #include <mls/state.h>
 #include <namespace.h>
 #include <set>
+#include <tuple>
 
 namespace MLS_NAMESPACE {
 
@@ -1431,14 +1432,43 @@ State::handle(const AnnotatedICommit& annotated_icommit)
     throw ProtocolError("SHeader signature failed to verify");
   }
 
-  // Rebuild the post-commit tree from the sender and receiver proofs.  A full
-  // client could instead apply the proposals to its local tree and merge the
-  // reconstructed path; both arrive at the same tree, so the prototype uses the
-  // proof-based construction for both (see "Full-client O(N) hazards" in
-  // splitcommit_delta.md).
-  auto new_tree =
-    TreeKEMPublicKey(_suite, annotated_icommit.sender_membership_proof_after);
-  new_tree.implant_slice(annotated_icommit.receiver_membership_proof_after);
+  // Rebuild the post-commit tree.  A full client applies the proposals to its
+  // own dense tree and merges the sender's path, so it remains a full client
+  // and can process later non-split Commits without restoring the tree.  A
+  // partial client has no dense tree and instead rebuilds the post-commit tree
+  // from the sender and receiver membership proofs.
+  const auto proposals = must_resolve(sheader.proposals, sender_location);
+  const auto full_client = _tree.is_complete();
+
+  auto new_tree = TreeKEMPublicKey{ _suite };
+  auto joiner_locations = std::vector<LeafIndex>{};
+  auto psks = std::vector<PSKWithSecret>{};
+  auto extensions = _extensions;
+  if (full_client) {
+    std::tie(new_tree, joiner_locations, psks, extensions) = apply(proposals);
+  } else {
+    new_tree =
+      TreeKEMPublicKey(_suite, annotated_icommit.sender_membership_proof_after);
+    new_tree.implant_slice(annotated_icommit.receiver_membership_proof_after);
+
+    // Identify GCE or PSK proposals, as in handle(AnnotatedCommit)
+    auto psk_ids = std::vector<PreSharedKeyID>{};
+    for (const auto& p : proposals) {
+      if (p.proposal.proposal_type() == ProposalType::psk) {
+        const auto& psk_proposal = var::get<PreSharedKey>(p.proposal.content);
+        psk_ids.push_back(psk_proposal.psk);
+      }
+
+      if (p.proposal.proposal_type() ==
+          ProposalType::group_context_extensions) {
+        const auto& gce_proposal =
+          var::get<GroupContextExtensions>(p.proposal.content);
+        extensions = gce_proposal.group_context_extensions;
+      }
+    }
+
+    psks = resolve(psk_ids);
+  }
 
   // Identify the encrypted path secret and how to decrypt it.  The ICommit
   // carries exactly one ciphertext: the resolution entry the receiver uses at
@@ -1458,66 +1488,114 @@ State::handle(const AnnotatedICommit& annotated_icommit)
       throw ProtocolError("Commit path has invalid leaf node");
     }
 
-    // The new keys below the common ancestor are given directly; the keys above
-    // are derived from the decrypted path secret by the ratchet.  Verify the
-    // supplied keys positionally against the sender's post-commit direct path,
-    // which the sender membership proof already authenticates (draft: the
-    // receiver maps `new_pks[i]` to the i-th path node below the LCA).
-    const auto coords = new_tree.ancestor_index(_index, sender_location);
-    path_secret_decrypt_node = coords.resolution_node;
-    encrypted_path_secret = path.encrypted_path_secret;
-
-    if (path.new_pks.size() != coords.ancestor_node_index) {
-      throw ProtocolError("Incorrect number of new path keys");
-    }
-
-    // Walk the sender's direct path from the leaf upward, skipping blank nodes,
-    // and match the first `ancestor_node_index` keys.  (The direct path is
-    // ordered leaf-first, as is `new_pks`.)
-    const auto& dp =
-      annotated_icommit.sender_membership_proof_after.direct_path_nodes;
-    auto path_index = size_t(0);
-    for (auto i = size_t(1);
-         i < dp.size() && path_index < coords.ancestor_node_index;
-         i++) {
-      if (dp.at(i).blank()) {
-        continue;
+    if (full_client) {
+      // The ICommit transmits only the path keys below the common ancestor.
+      // The sender's post-commit membership proof carries every node on the
+      // sender's direct path, including the keys above the common ancestor, so
+      // reconstruct the full UpdatePath from it and merge it into our tree.
+      const auto& proof_dp =
+        annotated_icommit.sender_membership_proof_after.direct_path_nodes;
+      const auto dirpath = NodeIndex(sender_location).dirpath(new_tree.size);
+      if (proof_dp.size() != dirpath.size() + 1) {
+        throw ProtocolError("Malformed sender membership proof");
       }
 
-      if (opt::get(dp.at(i).node).public_key() != path.new_pks.at(path_index)) {
-        throw ProtocolError("Incorrect new path key");
-      }
-      path_index += 1;
-    }
+      auto path_nodes = std::vector<UpdatePathNode>{};
+      auto dirpath_index = size_t(0);
+      for (const auto& entry :
+           new_tree.filtered_direct_path(NodeIndex(sender_location))) {
+        const auto& node = std::get<0>(entry);
+        while (dirpath_index < dirpath.size() &&
+               dirpath.at(dirpath_index) != node) {
+          dirpath_index += 1;
+        }
 
-    if (path_index != coords.ancestor_node_index) {
-      throw ProtocolError("Incorrect number of new path keys");
+        if (dirpath_index == dirpath.size()) {
+          throw ProtocolError("Malformed sender membership proof");
+        }
+
+        const auto& proof_node = proof_dp.at(dirpath_index + 1);
+        if (proof_node.blank()) {
+          throw ProtocolError("Blank node in sender direct path");
+        }
+
+        path_nodes.emplace_back(
+          UpdatePathNode{ opt::get(proof_node.node).public_key(), {} });
+      }
+
+      auto update_path =
+        UpdatePath{ opt::get(sheader.leaf_node), std::move(path_nodes) };
+      if (!new_tree.parent_hash_valid(sender_location, update_path)) {
+        throw ProtocolError("Split commit path has invalid parent hash");
+      }
+
+      new_tree.merge(sender_location, update_path);
+
+      const auto coords =
+        new_tree.decap_coords(_index, sender_location, joiner_locations);
+      path_secret_decrypt_node = coords.resolution_node;
+      encrypted_path_secret = path.encrypted_path_secret;
+
+      if (path.new_pks.size() != coords.ancestor_node_index) {
+        throw ProtocolError("Incorrect number of new path keys");
+      }
+
+      for (auto i = size_t(0); i < coords.ancestor_node_index; i++) {
+        if (update_path.nodes.at(i).public_key != path.new_pks.at(i)) {
+          throw ProtocolError("Incorrect new path key");
+        }
+      }
+    } else {
+      // The new keys below the common ancestor are given directly; the keys
+      // above are derived from the decrypted path secret by the ratchet.
+      // Verify the supplied keys positionally against the sender's post-commit
+      // direct path, which the sender membership proof already authenticates
+      // (draft: the receiver maps `new_pks[i]` to the i-th path node below the
+      // LCA).
+      const auto coords = new_tree.ancestor_index(_index, sender_location);
+      path_secret_decrypt_node = coords.resolution_node;
+      encrypted_path_secret = path.encrypted_path_secret;
+
+      if (path.new_pks.size() != coords.ancestor_node_index) {
+        throw ProtocolError("Incorrect number of new path keys");
+      }
+
+      // Walk the sender's direct path from the leaf upward, skipping blank
+      // nodes, and match the first `ancestor_node_index` keys.  (The direct path
+      // is ordered leaf-first, as is `new_pks`.)
+      const auto& dp =
+        annotated_icommit.sender_membership_proof_after.direct_path_nodes;
+      auto path_index = size_t(0);
+      for (auto i = size_t(1);
+           i < dp.size() && path_index < coords.ancestor_node_index;
+           i++) {
+        if (dp.at(i).blank()) {
+          continue;
+        }
+
+        if (opt::get(dp.at(i).node).public_key() != path.new_pks.at(path_index)) {
+          throw ProtocolError("Incorrect new path key");
+        }
+        path_index += 1;
+      }
+
+      if (path_index != coords.ancestor_node_index) {
+        throw ProtocolError("Incorrect number of new path keys");
+      }
     }
+  }
+
+  // A full client has the complete post-commit tree, so it can check it against
+  // the authenticated tree hash.  (A partial client only holds the two proofs,
+  // whose agreement was already checked above.)
+  if (full_client && new_tree.root_hash() != tree_hash_after) {
+    throw ProtocolError("Split commit tree hash mismatch");
   }
 
   // Update the transcript hash.  Draft §5: the confirmed transcript hash input
   // is the SHeader with an empty epoch_identifier and no signature.
   const auto new_confirmed_transcript_hash = _transcript_hash.new_confirmed(
     content_auth.split_confirmed_transcript_hash_input());
-
-  // Identify GCE or PSK proposals, as in handle(AnnotatedCommit)
-  const auto proposals = must_resolve(sheader.proposals, sender_location);
-  auto extensions = _extensions;
-  auto psk_ids = std::vector<PreSharedKeyID>{};
-  for (const auto& p : proposals) {
-    if (p.proposal.proposal_type() == ProposalType::psk) {
-      const auto& psk_proposal = var::get<PreSharedKey>(p.proposal.content);
-      psk_ids.push_back(psk_proposal.psk);
-    }
-
-    if (p.proposal.proposal_type() == ProposalType::group_context_extensions) {
-      const auto& gce_proposal =
-        var::get<GroupContextExtensions>(p.proposal.content);
-      extensions = gce_proposal.group_context_extensions;
-    }
-  }
-
-  const auto psks = resolve(psk_ids);
 
   // Ratchet without a transmitted confirmation tag (split mode): the locally
   // computed tag feeds the interim transcript hash but is not verified.

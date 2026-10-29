@@ -176,9 +176,11 @@ struct TreeKEMPublicKey
 
   TreeSlice extract_slice(LeafIndex leaf) const;
   void implant_slice(const TreeSlice& slice);
-  std::tuple<HPKECiphertext, NodeIndex> slice_path(UpdatePath path,
-                                                   LeafIndex from,
-                                                   LeafIndex to) const;
+  // `nodes` is the sender's filtered direct path as it appears in the commit
+  // (UpdatePath::nodes or SUpdatePath::nodes); the full update path is not
+  // needed, so callers avoid copying the per-receiver ciphertext fan-out.
+  std::tuple<HPKECiphertext, NodeIndex> slice_path(
+    const std::vector<UpdatePathNode>& nodes, LeafIndex from, LeafIndex to) const;
 
   struct AncestorIndex
   {

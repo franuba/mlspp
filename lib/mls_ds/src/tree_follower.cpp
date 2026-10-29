@@ -245,9 +245,8 @@ TreeFollower::split(const SCommit& scommit, LeafIndex receiver) const
 
   // The ciphertext the receiver decrypts at the common ancestor (this is the
   // same lookup the resolution code uses to find the decryption node)
-  const auto path = UpdatePath{ opt::get(sheader.leaf_node), s_path.nodes };
   const auto ciphertext =
-    std::get<0>(_tree.slice_path(path, from, receiver));
+    std::get<0>(_tree.slice_path(s_path.nodes, from, receiver));
 
   auto new_pks = std::vector<HPKEPublicKey>{};
   new_pks.reserve(ancestor.ancestor_node_index);

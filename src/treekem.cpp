@@ -701,7 +701,7 @@ TreeKEMPublicKey::implant_slice(const TreeSlice& slice)
 }
 
 std::tuple<HPKECiphertext, NodeIndex>
-TreeKEMPublicKey::slice_path(UpdatePath path,
+TreeKEMPublicKey::slice_path(const std::vector<UpdatePathNode>& nodes,
                              LeafIndex from,
                              LeafIndex to) const
 {
@@ -727,7 +727,7 @@ TreeKEMPublicKey::slice_path(UpdatePath path,
     }
 
     const auto j = static_cast<size_t>(res_it - res.begin());
-    return { path.nodes.at(i).encrypted_path_secret.at(j), *res_it };
+    return { nodes.at(i).encrypted_path_secret.at(j), *res_it };
   }
 
   throw ProtocolError("Decryption node not found");

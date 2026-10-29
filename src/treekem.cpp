@@ -414,7 +414,9 @@ TreeKEMPrivateKey::consistent(const TreeKEMPublicKey& other) const
     private_key(node);
   }
 
-  return stdx::all_of(private_key_cache, [other](const auto& entry) {
+  // Capture the public tree by reference: capturing the reference variable by
+  // copy would copy the whole (possibly dense) ratchet tree into the closure.
+  return stdx::all_of(private_key_cache, [&other](const auto& entry) {
     const auto& [node, priv] = entry;
     const auto& opt_node = other.node_at(node).node;
     if (!opt_node) {

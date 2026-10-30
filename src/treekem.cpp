@@ -733,6 +733,54 @@ TreeKEMPublicKey::slice_path(const std::vector<UpdatePathNode>& nodes,
   throw ProtocolError("Decryption node not found");
 }
 
+std::vector<std::tuple<HPKECiphertext, NodeIndex>>
+TreeKEMPublicKey::slice_path_all(const std::vector<UpdatePathNode>& nodes,
+                                 LeafIndex from,
+                                 const std::vector<LeafIndex>& receivers) const
+{
+  // The expensive part of slice_path() is filtered_direct_path(): resolving
+  // the sender's copath can walk whole blank subtrees.  Resolve once, then
+  // each receiver only scans this (log N)-entry path.
+  const auto fdp = filtered_direct_path(NodeIndex(from));
+
+  auto out = std::vector<std::tuple<HPKECiphertext, NodeIndex>>{};
+  out.reserve(receivers.size());
+
+  for (const auto receiver : receivers) {
+    const auto toi = NodeIndex(receiver);
+    auto found = false;
+
+    for (auto i = size_t(0); i < fdp.size() && !found; i++) {
+      const auto& [dpi, res] = fdp.at(i);
+
+      if (!toi.is_below(dpi)) {
+        continue;
+      }
+
+      // An unmerged leaf holds no private key for the resolution node above
+      // it, so it decrypts with its own leaf, which the resolution also lists.
+      auto res_it = stdx::find(res, toi);
+      if (res_it == res.end()) {
+        res_it =
+          stdx::find_if(res, [&](const auto n) { return toi.is_below(n); });
+      }
+      if (res_it == res.end()) {
+        continue;
+      }
+
+      const auto j = static_cast<size_t>(res_it - res.begin());
+      out.emplace_back(nodes.at(i).encrypted_path_secret.at(j), *res_it);
+      found = true;
+    }
+
+    if (!found) {
+      throw ProtocolError("Decryption node not found");
+    }
+  }
+
+  return out;
+}
+
 void
 TreeKEMPublicKey::implant_slice_unchecked(const TreeSlice& slice)
 {
@@ -857,6 +905,13 @@ TreeKEMPublicKey::decap_coords(
     const auto& [node, _resolution] = pair;
     return node == ancestor;
   });
+
+  // A receiver whose common ancestor with the sender is not on the sender's
+  // filtered direct path (e.g. the sender itself) has no decryption node.
+  if (ancestor_node_it == from_fdp.end()) {
+    throw ProtocolError("No decryption node for receiver");
+  }
+
   const auto ancestor_node_index =
     static_cast<size_t>(ancestor_node_it - from_fdp.begin());
 

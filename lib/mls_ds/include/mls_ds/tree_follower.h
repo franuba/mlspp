@@ -35,6 +35,13 @@ public:
   // reflect `scommit`, i.e., update(scommit, ...) must have been called first.
   ICommit split(const SCommit& scommit, LeafIndex receiver) const;
 
+  // Batch variant of split() for a DS that hands the commit to every member:
+  // resolves the sender's filtered direct path once and returns one ICommit
+  // per entry of `receivers`, in the same order.  Same preconditions as
+  // split(); the per-receiver work is O(log N) instead of O(N).
+  std::vector<ICommit> split_all(const SCommit& scommit,
+                                 const std::vector<LeafIndex>& receivers) const;
+
   // Accessors
   CipherSuite cipher_suite() const { return _suite; }
   const TreeKEMPublicKey& tree() const { return _tree; }

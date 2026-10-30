@@ -190,6 +190,28 @@ commit_sender(const Sender& sender)
   return var::get<MemberSender>(sender.sender).sender;
 }
 
+// Assemble the ICommit for a receiver from the ciphertext at its common
+// ancestor and the path public keys below it.
+static ICommit
+make_icommit(const SCommit& scommit,
+             const std::vector<UpdatePathNode>& nodes,
+             size_t ancestor_index,
+             const HPKECiphertext& ciphertext)
+{
+  if (ancestor_index > nodes.size()) {
+    throw ProtocolError("UpdatePath shorter than committer direct path");
+  }
+
+  auto new_pks = std::vector<HPKEPublicKey>{};
+  new_pks.reserve(ancestor_index);
+  for (auto i = size_t(0); i < ancestor_index; i++) {
+    new_pks.push_back(nodes.at(i).public_key);
+  }
+
+  return ICommit{ scommit.sheader,
+                  IUpdatePath{ ciphertext, std::move(new_pks) } };
+}
+
 void
 TreeFollower::update(const SCommit& scommit,
                      const std::vector<MLSMessage>& extra_proposals)
@@ -248,15 +270,57 @@ TreeFollower::split(const SCommit& scommit, LeafIndex receiver) const
   const auto ciphertext =
     std::get<0>(_tree.slice_path(s_path.nodes, from, receiver));
 
-  auto new_pks = std::vector<HPKEPublicKey>{};
-  new_pks.reserve(ancestor.ancestor_node_index);
-  for (auto i = size_t(0); i < ancestor.ancestor_node_index; i++) {
-    new_pks.push_back(s_path.nodes.at(i).public_key);
+  return make_icommit(
+    scommit, s_path.nodes, ancestor.ancestor_node_index, ciphertext);
+}
+
+std::vector<ICommit>
+TreeFollower::split_all(const SCommit& scommit,
+                        const std::vector<LeafIndex>& receivers) const
+{
+  const auto [sender, sheader] = unframe_sheader(scommit.sheader);
+
+  // A commit with no path needs no splitting: every receiver gets the SHeader
+  if (!scommit.path) {
+    return std::vector<ICommit>(
+      receivers.size(), ICommit{ scommit.sheader, std::nullopt });
   }
 
-  return ICommit{
-    scommit.sheader, IUpdatePath{ ciphertext, std::move(new_pks) }
-  };
+  const auto from = commit_sender(sender);
+
+  if (!sheader.leaf_node) {
+    throw ProtocolError("SCommit with path but no SHeader leaf_node");
+  }
+  const auto& s_path = opt::get(scommit.path);
+
+  // The committer holds every key on its own path and needs no slice.
+  auto need_slice = std::vector<LeafIndex>{};
+  need_slice.reserve(receivers.size());
+  for (const auto receiver : receivers) {
+    if (receiver != from) {
+      need_slice.push_back(receiver);
+    }
+  }
+
+  // One resolution of the sender's filtered direct path for all receivers.
+  const auto slices = _tree.slice_path_all(s_path.nodes, from, need_slice);
+
+  auto out = std::vector<ICommit>{};
+  out.reserve(receivers.size());
+  auto next_slice = size_t(0);
+  for (const auto receiver : receivers) {
+    if (receiver == from) {
+      out.push_back(ICommit{ scommit.sheader, std::nullopt });
+      continue;
+    }
+
+    const auto& slice = slices.at(next_slice++);
+    const auto ancestor = _tree.ancestor_index(receiver, from);
+    out.push_back(make_icommit(
+      scommit, s_path.nodes, ancestor.ancestor_node_index, std::get<0>(slice)));
+  }
+
+  return out;
 }
 
 } // namespace MLS_NAMESPACE::mls_ds

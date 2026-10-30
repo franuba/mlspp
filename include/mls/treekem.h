@@ -182,6 +182,16 @@ struct TreeKEMPublicKey
   std::tuple<HPKECiphertext, NodeIndex> slice_path(
     const std::vector<UpdatePathNode>& nodes, LeafIndex from, LeafIndex to) const;
 
+  // One-pass variant of slice_path() for several receivers: the sender's
+  // filtered direct path is resolved once and reused, so a DS splitting a
+  // commit for every member does not pay an O(N) resolution per receiver.
+  // Returns one (ciphertext, decryption node) pair per entry of `receivers`,
+  // in the same order.  `from` must not appear in `receivers`.
+  std::vector<std::tuple<HPKECiphertext, NodeIndex>> slice_path_all(
+    const std::vector<UpdatePathNode>& nodes,
+    LeafIndex from,
+    const std::vector<LeafIndex>& receivers) const;
+
   struct AncestorIndex
   {
     size_t ancestor_node_index;
